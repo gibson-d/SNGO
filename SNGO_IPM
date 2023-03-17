@@ -1,0 +1,1262 @@
+rm(list=ls())
+
+# See https://r-nimble.org/html_manual/cha-installing-nimble.html for how to install nimble. Requires more than just the package.
+library(nimble)
+require(sp)
+library(RColorBrewer)
+library(maps)
+library(rgdal)
+library(mapproj)
+library(rgeos)
+library(maptools)
+library(raster)
+library(dplyr)
+
+#------------------------------------------------------------------------------
+# Data manipulation of banding data 
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------#
+# Read in banding dataset
+#------------------------------------------------------------------------------#
+setwd("\\\\r2d2.cnre.vt.edu\\R2D2\\Dan_G\\SGWH")
+
+raw.band<-read.csv("LIGHT_bnd(1690,1691,1695,1698,1699,1700,1703)_BBLthru2022-7.csv") 
+summary(raw.band)
+########################################################################
+#cleaning data
+########################################################################
+#only use status 3 birds: Normal caught, wild, released alive
+clean.band <-subset(raw.band,BIRD_STATUS==3)      
+start <- 1970
+#only use Birds released after start
+clean.band<-subset(clean.band,BANDING_YEAR>=start)        
+
+#remove unknown sex
+clean.band<-subset(clean.band,SEX_CODE!=0)               
+clean.band<-subset(clean.band,SEX_CODE!=6)                
+clean.band<-subset(clean.band,SEX_CODE!=7)               
+
+# Add Info include ==
+#-----------------------------------------------------------------------#
+  # 0-Fed band + more 'benign' additional marking/capture assigments
+  # 0 : USFWS only
+  # 1 : tarsal
+  # 2 : neck color
+  # 8 : temporary
+  # 18 : bled
+  # 19 : bleed, auxiliary (cross-check with comments)
+  # 25 : two auxiliary (cross-check with comments)
+  # 29 : misc aux (cross-check with comments)
+  # 80 : GPS (exclude)
+  # 85 : combination of things (cross-check with comments)
+
+clean.band<-subset(clean.band,  EXTRA_INFO_CODE==0 | EXTRA_INFO_CODE==1  |  EXTRA_INFO_CODE==2 |
+                     EXTRA_INFO_CODE==8 | EXTRA_INFO_CODE==18 | EXTRA_INFO_CODE==19 |  EXTRA_INFO_CODE==25 |
+                     EXTRA_INFO_CODE==29| EXTRA_INFO_CODE==85)
+
+# Extract transmittered birds
+transmitters <- subset(clean.band, grepl('TRANSMITTER',B_MARKER_LONG_DESC))
+# Remove remaining transmitter birds
+clean.band   <- subset(clean.band, !grepl('TRANSMITTER',B_MARKER_LONG_DESC))
+#remove unknown age
+clean.band<-subset(clean.band,AGE_CODE!=0)           
+
+#--------------------------------------------------------------------------------------------------------------------------------------#
+# Delineate Seasonal Banding Regimes: For this purpose, I imagine we are only going to keep individuals released between June and September
+#--------------------------------------------------------------------------------------------------------------------------------------#
+
+clean.band$Regime <- ifelse(clean.band$BANDING_MONTH==6|clean.band$BANDING_MONTH==7| clean.band$BANDING_MONTH==8| clean.band$BANDING_MONTH==9,"B",
+                            ifelse(clean.band$BANDING_MONTH==10| clean.band$BANDING_MONTH==11| clean.band$BANDING_MONTH==12,"F",
+                                   ifelse(clean.band$BANDING_MONTH==1| clean.band$BANDING_MONTH==2| clean.band$BANDING_MONTH==3,"W",'E'))) 
+
+#------------------------------------------------------------------------------#
+# Clean up age-class data
+#------------------------------------------------------------------------------#
+clean.band$Age_Verbal <- ifelse(clean.band$AGE_CODE == 1, 'AHY',
+                                ifelse(clean.band$AGE_CODE == 2, 'HY',
+                                       ifelse(clean.band$AGE_CODE == 4, 'L',
+                                              ifelse(clean.band$AGE_CODE == 5, 'SY',
+                                                     ifelse(clean.band$AGE_CODE == 6, 'ASY',
+                                                            ifelse(clean.band$AGE_CODE == 8, 'ATY', NA))))))
+
+clean.band$Age <- ifelse(clean.band$AGE_CODE == 1, 3,
+                         ifelse(clean.band$AGE_CODE == 2, 1,
+                                ifelse(clean.band$AGE_CODE == 4, 1,
+                                       ifelse(clean.band$AGE_CODE == 5, 2,
+                                              ifelse(clean.band$AGE_CODE == 6, 3,
+                                                     ifelse(clean.band$AGE_CODE == 8, 3, NA))))))
+
+#------------------------------------------------------------------------------#
+# Look at age - season combinations
+#------------------------------------------------------------------------------#
+table(clean.band$Age_Verbal, clean.band$Regime)
+
+#------------------------------------------------------------------------------#
+# might be important to consider temporal variation in reporting rates
+#------------------------------------------------------------------------------#
+# Old (mail in only) vs new (phone/internet) band contact
+clean.band$TYPE <- ifelse(clean.band$BAND_TYPE_CODE == '11'| clean.band$BAND_TYPE_CODE == '18'| clean.band$BAND_TYPE_CODE == '21', 1,
+                          ifelse(clean.band$BAND_TYPE_CODE  == '01' |clean.band$BAND_TYPE_CODE  == '04'|clean.band$BAND_TYPE_CODE  == '41' | clean.band$BAND_TYPE_CODE == '51' |clean.band$BAND_TYPE_CODE == '81' | clean.band$BAND_TYPE_CODE == 'W1', 2,
+                                 NA))
+
+#------------------------------------------------------------------------------#
+# Retain only individuals released between June and Sept.
+#------------------------------------------------------------------------------#
+bands.breed <- subset(clean.band, Regime == 'B')
+#------------------------------------------------------------------------------#
+# Retain individuals released from Wrengle, as well as keep AK and canada birds for the time being
+#------------------------------------------------------------------------------#
+# 98 = Wrengel Island, 3 = North Slope, AK, 43 = NWT [mostly Banks Island]
+bands.breed <- subset(bands.breed, REGION == 98 | REGION == 3   & LAT_DECIMAL_DEGREES > 68.0 | REGION == 43 & LAT_DECIMAL_DEGREES < 75.0)
+
+#------------------------------------------------------------------------------#
+# Read in band encounter data
+#------------------------------------------------------------------------------#
+raw.enc <-read.csv("LIGHT_enc(1690,1691,1695,1698,1699,1700,1703)_BBLthru2022-7.csv")  #reading in CSV
+
+#------------------------------------------------------------------------------#
+# Subset encounters to only consider individuals retained in the release file
+#------------------------------------------------------------------------------#
+enc_released <- raw.enc[raw.enc$ORIGINAL_BAND %in% bands.breed$ORIGINAL_BAND,]
+
+#------------------------------------------------------------------------------#
+# Clean up age-class data
+#------------------------------------------------------------------------------#
+enc_released$R_Age <- ifelse(enc_released$B_AGE_CODE == 1, 3,
+                             ifelse(enc_released$B_AGE_CODE == 2, 1,
+                                    ifelse(enc_released$B_AGE_CODE == 4, 1,
+                                           ifelse(enc_released$B_AGE_CODE == 5, 2,
+                                                  ifelse(enc_released$B_AGE_CODE == 6, 3,
+                                                         ifelse(enc_released$B_AGE_CODE == 8, 3, NA))))))
+
+#------------------------------------------------------------------------------#
+# Retain only hunter-shot encounters
+#------------------------------------------------------------------------------#
+shot_encounters <- subset(enc_released, E_HOW_OBTAINED_CODE == 1)
+
+#------------------------------------------------------------------------------#
+# Exclude individuals that didn't survive until the first hunting season (0) or an unknown number of hunting seasons (99)
+#------------------------------------------------------------------------------#
+shot_encounters <- subset(shot_encounters, HSS != 0 & HSS != 99)
+
+#------------------------------------------------------------------------------#
+# For the time being, assign 'vague' recoveries the middle month of the known season an individual was harvested
+#------------------------------------------------------------------------------#
+shot_encounters$ENCOUNTER_MONTH <- ifelse(shot_encounters$ENCOUNTER_MONTH == 82,  8,
+                                          ifelse(shot_encounters$ENCOUNTER_MONTH == 83, 5,
+                                                 ifelse(shot_encounters$ENCOUNTER_MONTH == 92,2,
+                                                        ifelse(shot_encounters$ENCOUNTER_MONTH == 93,11,
+                                                               ifelse(shot_encounters$ENCOUNTER_MONTH == 94, 11, shot_encounters$ENCOUNTER_MONTH)))))
+
+#shot_encounters <- subset(shot_encounters, ENCOUNTER_MONTH > 8 | ENCOUNTER_MONTH < 2)
+
+
+#------------------------------------------------------------------------------#
+# Develop global capture history
+#------------------------------------------------------------------------------#
+ch <- rbind.data.frame(cbind.data.frame(ID = bands.breed$ORIGINAL_BAND, Year = bands.breed$BANDING_YEAR, Sex = bands.breed$SEX_CODE, 
+                                        REGION = bands.breed$REGION, BAge = bands.breed$Age, Code = 1),
+                       cbind.data.frame(ID = shot_encounters$ORIGINAL_BAND, Year = shot_encounters$BANDING_YEAR + shot_encounters$HSS,
+                                        Sex = shot_encounters$B_SEX_CODE, REGION = shot_encounters$B_REGION, BAge = shot_encounters$R_Age, Code = 2))
+
+AK_Releases <- subset(bands.breed, REGION == 3)
+#------------------------------------------------------------------------------#
+# Subset capture histories in regional groups of each sex and age-class
+#------------------------------------------------------------------------------#
+ch_russia <- subset(ch, REGION == 98)
+ch_alaska <- subset(ch, REGION == 3)
+ch_canada <- subset(ch, REGION == 43)
+
+ch_russia_m_1 <- subset(ch_russia , Sex == 4 & BAge == 1)
+ch_alaska_m_1 <- subset(ch_alaska , Sex == 4 & BAge == 1)
+ch_canada_m_1 <- subset(ch_canada , Sex == 4 & BAge == 1)
+ch_russia_m_2 <- subset(ch_russia , Sex == 4 & BAge == 2)
+ch_alaska_m_2 <- subset(ch_alaska , Sex == 4 & BAge == 2)
+ch_canada_m_2 <- subset(ch_canada , Sex == 4 & BAge == 2)
+ch_russia_m_3 <- subset(ch_russia , Sex == 4 & BAge == 3)
+ch_alaska_m_3 <- subset(ch_alaska , Sex == 4 & BAge == 3)
+ch_canada_m_3 <- subset(ch_canada , Sex == 4 & BAge == 3)
+ch_russia_f_1 <- subset(ch_russia , Sex == 5 & BAge == 1)
+ch_alaska_f_1 <- subset(ch_alaska , Sex == 5 & BAge == 1)
+ch_canada_f_1 <- subset(ch_canada , Sex == 5 & BAge == 1)
+ch_russia_f_2 <- subset(ch_russia , Sex == 5 & BAge == 2)
+ch_alaska_f_2 <- subset(ch_alaska , Sex == 5 & BAge == 2)
+ch_canada_f_2 <- subset(ch_canada , Sex == 5 & BAge == 2)
+ch_russia_f_3 <- subset(ch_russia , Sex == 5 & BAge == 3)
+ch_alaska_f_3 <- subset(ch_alaska , Sex == 5 & BAge == 3)
+ch_canada_f_3 <- subset(ch_canada , Sex == 5 & BAge == 3)
+#------------------------------------------------------------------------------#
+# For the time being, attach a matrix of zeros for each year of the study to deal 
+# with 'ragged' encounter histories. These will get removed in the next step, but
+# protect against 'skipping' over years with no birds released
+#------------------------------------------------------------------------------#
+ch_russia_m_1 <- rbind.data.frame(ch_russia_m_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_m_1 <- rbind.data.frame(ch_alaska_m_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_m_1 <- rbind.data.frame(ch_canada_m_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_russia_m_2 <- rbind.data.frame(ch_russia_m_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_m_2 <- rbind.data.frame(ch_alaska_m_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_m_2 <- rbind.data.frame(ch_canada_m_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_russia_m_3 <- rbind.data.frame(ch_russia_m_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_m_3 <- rbind.data.frame(ch_alaska_m_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_m_3 <- rbind.data.frame(ch_canada_m_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_russia_f_1 <- rbind.data.frame(ch_russia_f_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_f_1 <- rbind.data.frame(ch_alaska_f_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_f_1 <- rbind.data.frame(ch_canada_f_1, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_russia_f_2 <- rbind.data.frame(ch_russia_f_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_f_2 <- rbind.data.frame(ch_alaska_f_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_f_2 <- rbind.data.frame(ch_canada_f_2, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_russia_f_3 <- rbind.data.frame(ch_russia_f_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_alaska_f_3 <- rbind.data.frame(ch_alaska_f_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+ch_canada_f_3 <- rbind.data.frame(ch_canada_f_3, cbind.data.frame(ID = 1:length(1970:2022), Year = (1970:2022), Sex = NA, REGION = NA, BAge = NA, Code = 0 ))
+
+library(tidyr)
+#-------------------------------------------------------------------------------------------#
+# generate individual based capture histories for Wrengle (ru), alaska (ak), and Canada (ca) 
+#-------------------------------------------------------------------------------------------#
+ch_ru_m_1 <- ch_russia_m_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_m_1 <- ch_alaska_m_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_m_1 <- ch_canada_m_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ru_m_2 <- ch_russia_m_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_m_2 <- ch_alaska_m_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_m_2 <- ch_canada_m_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ru_m_3 <- ch_russia_m_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_m_3 <- ch_alaska_m_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_m_3 <- ch_canada_m_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ru_f_1 <- ch_russia_f_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_f_1 <- ch_alaska_f_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_f_1 <- ch_canada_f_1 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ru_f_2 <- ch_russia_f_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_f_2 <- ch_alaska_f_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_f_2 <- ch_canada_f_2 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ru_f_3 <- ch_russia_f_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_al_f_3 <- ch_alaska_f_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+ch_ca_f_3 <- ch_canada_f_3 %>% group_by(ID) %>%distinct() %>% spread(Year, Code, fill = 0) 
+
+library(IPMbook)
+
+#-------------------------------------------------------------------------------------------#
+# translate individual capture histories to m-arrays
+#-------------------------------------------------------------------------------------------#
+ch_ru_hy_ma <- marray(data.matrix(ch_ru_m_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_hy_ma <- marray(data.matrix(ch_al_m_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_hy_ma <- marray(data.matrix(ch_ca_m_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ru_sy_ma <- marray(data.matrix(ch_ru_m_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_sy_ma <- marray(data.matrix(ch_al_m_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_sy_ma <- marray(data.matrix(ch_ca_m_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ru_ad_ma <- marray(data.matrix(ch_ru_m_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_ad_ma <- marray(data.matrix(ch_al_m_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_ad_ma <- marray(data.matrix(ch_ca_m_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ru_hy_fe <- marray(data.matrix(ch_ru_f_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_hy_fe <- marray(data.matrix(ch_al_f_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_hy_fe <- marray(data.matrix(ch_ca_f_1[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ru_sy_fe <- marray(data.matrix(ch_ru_f_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_sy_fe <- marray(data.matrix(ch_al_f_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_sy_fe <- marray(data.matrix(ch_ca_f_2[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ru_ad_fe <- marray(data.matrix(ch_ru_f_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_al_ad_fe <- marray(data.matrix(ch_al_f_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+ch_ca_ad_fe <- marray(data.matrix(ch_ca_f_3[-c(1:length(1970:2022)),-c(1:4)]), unobs = 0)
+
+keep1 <- c(seq(from = 2, to = 104, 2))
+keep2 <- c(seq(from = 2, to = 104, 2),105)
+
+ch_ru_hy_ma <- ch_ru_hy_ma[-keep1,keep2]
+ch_al_hy_ma <- ch_al_hy_ma[-keep1,keep2]
+ch_ca_hy_ma <- ch_ca_hy_ma[-keep1,keep2]
+ch_ru_sy_ma <- ch_ru_sy_ma[-keep1,keep2]
+ch_al_sy_ma <- ch_al_sy_ma[-keep1,keep2]
+ch_ca_sy_ma <- ch_ca_sy_ma[-keep1,keep2]
+ch_ru_ad_ma <- ch_ru_ad_ma[-keep1,keep2]
+ch_al_ad_ma <- ch_al_ad_ma[-keep1,keep2]
+ch_ca_ad_ma <- ch_ca_ad_ma[-keep1,keep2]
+ch_ru_hy_fe <- ch_ru_hy_fe[-keep1,keep2]
+ch_al_hy_fe <- ch_al_hy_fe[-keep1,keep2]
+ch_ca_hy_fe <- ch_ca_hy_fe[-keep1,keep2]
+ch_ru_sy_fe <- ch_ru_sy_fe[-keep1,keep2]
+ch_al_sy_fe <- ch_al_sy_fe[-keep1,keep2]
+ch_ca_sy_fe <- ch_ca_sy_fe[-keep1,keep2]
+ch_ru_ad_fe <- ch_ru_ad_fe[-keep1,keep2]
+ch_al_ad_fe <- ch_al_ad_fe[-keep1,keep2]
+ch_ca_ad_fe <- ch_ca_ad_fe[-keep1,keep2]
+
+library(abind)
+#-------------------------------------------------------------------------------------------#
+# Lump into age-specific m-arrays for each region (dimension 3) and sex (dimension 4)
+#-------------------------------------------------------------------------------------------#
+marr_hy  <- abind(abind(ch_al_hy_fe ,ch_ca_hy_fe, ch_ru_hy_fe , along = 3), abind(ch_al_hy_ma ,ch_ca_hy_ma, ch_ru_hy_ma , along = 3), along = 4)
+marr_sy  <- abind(abind(ch_al_sy_fe ,ch_ca_sy_fe, ch_ru_sy_fe , along = 3), abind(ch_al_sy_ma ,ch_ca_sy_ma, ch_ru_sy_ma , along = 3), along = 4)
+marr_ad  <- abind(abind(ch_al_ad_fe ,ch_ca_ad_fe, ch_ru_ad_fe , along = 3), abind(ch_al_ad_ma ,ch_ca_ad_ma, ch_ru_ad_ma , along = 3), along = 4)
+
+########################################
+library(LaplacesDemon)
+sig1 = c(.25,.25,.25)
+Lambda1 = diag(sig1)
+I1 = diag(3)
+nu1 = 3 + 1
+Q1 = rinvwishart(nu1, I1)    # note output is an array
+Delta1 = matrix(0, 3, 3)
+
+for (j in 1:3){
+  Delta1[j,j] = Q1[j,j]^(-0.5)
+}
+
+P1 = Delta1 %*% Q1 %*% Delta1
+Sigma1 = Lambda1 %*% P1 %*% Lambda1
+
+Lambda = abind(Lambda1, Lambda1, along = 3)
+Q = abind(Q1, Q1, along = 3)
+Delta = abind(Delta1, Delta1, along = 3)
+Sigma = abind(Sigma1, Sigma1, along = 3)
+P = abind(P1, P1, along = 3)
+
+setwd("\\\\r2d2.cnre.vt.edu\\R2D2\\Dan_G\\SGWH")
+
+pcs <- read.csv('2023-3-10_US harvest by species age sex_thru2021-22(wPartsXCohort).csv')
+
+SGWH    <- subset(pcs, SpecCode == 'SGWH' & Season >=1970)
+
+SGWH_WA <- subset(SGWH, ST == 'WA')
+SGWH_PF <- subset(SGWH, ST == 'PF')
+
+wing_j <- SGWH_PF$WingsIU
+wing_a <- SGWH_PF$WingsAU
+wing_j_a <- wing_j + wing_a
+
+H_J <- c(as.numeric(SGWH_PF$IU_Orig))/100000
+H_A <- c(as.numeric(SGWH_PF$AU_Orig))/100000
+
+Total_N <- read.csv('Total_N.csv')
+Total_N_100k <- Total_N[,2:12]/100000
+
+wrengle_prod <- read.csv('wrengel_production.csv')
+wrengle_prod <- subset(wrengle_prod, Year >= start)
+nests        <- wrengle_prod$Nests
+ns           <- wrengle_prod$NS
+cs           <- wrengle_prod$CS
+gs           <- wrengle_prod$GS
+
+reporting <- read.csv("Estimated reporting rates, MALL & NOPI, 1948 to 2010.csv",header=TRUE)
+reporting <- subset(reporting, year >= 1970 )
+
+MU_R1 <- reporting$NOPI.rho
+SD_R1 <- reporting$NOPI.rho.SD
+
+MU_R <- c(MU_R1, rep(MU_R1[41], dim(marr_hy)[2] - length(MU_R1)))
+SD_R <- c(SD_R1, rep(SD_R1[41], dim(marr_hy)[2] - length(MU_R1)))
+
+ns.edit <- ifelse(ns == 0, 0.01,ns)
+
+AK_HY <- apply(marr_hy[,,1,], 1, sum)
+AK_SY <- apply(marr_sy[,,1,], 1, sum)
+AK_AD <- apply(apply(marr_ad[,,1,], c(1,3), sum),1,max)
+
+CA_HY <- apply(marr_hy[,,2,], 1, sum)
+CA_SY <- apply(marr_sy[,,2,], 1, sum)
+CA_AD <- apply(apply(marr_ad[,,2,], c(1,3), sum),1,max)
+
+
+ak_brood   <- read.csv('AK_Brood.csv')
+ak_adults  <- t((ak_brood[,c('Year','Colony','Adults')] %>% group_by(Colony)%>% spread(Year,Adults))[,-1])
+ak_gosling <- t((ak_brood[,c('Year','Colony','Goslings')] %>% group_by(Colony)%>% spread(Year,Goslings))[,-1])
+
+ak_adults_round <- ceiling(ak_adults/2)
+
+# Alaska Brood and Nesting Data
+# 1992 - 2015
+Igpik_NB <- c(rep(NA,22),c(80,56,10,90,0,60,NA,200,1000,560,604,934,28,158,351,4290,5116,416,2330,1250,2700,2500,5700,850),rep(NA,7))
+Igpik_BR <- c(rep(NA,22),c(120,84,10,110,0,100,NA,352,500,670,1836,2298,2872,2232,4772,5010,9282,8958,9538,17772,10762,18102,16642,24746),rep(NA,7))
+Igpik_NS <- c(rep(NA,22),c(0.07,0.21,NA,NA,NA,NA,NA,NA,NA,0.48,0.63,0.97,0.9,0.7,0.86,0.85,0.89,0.01,0.085,0.655,0.496,0.415,0.154,0.966),rep(NA,7))
+# 2011 - 2018
+Col_NS  <- c(rep(NA,41),c(0.914285714,0.801169591,0.377431907,0.535211268,0.934306569,0.932291667,0.90212766,0.728606357),rep(NA,4))
+
+library(nimble)
+
+nimble_model <- nimbleCode({
+  
+  # Reporting rate likelihood
+  for (t in 1:(n.occasions)){
+    rr[t] ~ dbeta(alpha.rr[t], beta.rr[t])
+    alpha.rr[t] <- pow(SD.rr[t],-2) * RR.rr[t]
+    beta.rr[t] <- pow(SD.rr[t],-2) * (1 - RR.rr[t])
+  }
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+  # Cholesky decomposition [annual covariance in demographic traits]
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+  for(a in 1:n.sex){ 
+    for(i in 1:K){ 
+            mu_n[i,a] <- 0
+           sig_n[i,a] ~ T(dt(0, pow(2.5, -2), 1),0,)
+       Delta_n[i,i,a] <- pow(Q_n[i,i,a], -0.5)
+      Lambda_n[i,i,a] <- sig_n[i,a]
+      
+            mu_f[i,a] <- 0
+           sig_f[i,a] ~ T(dt(0, pow(2.5, -2), 1),0,)
+       Delta_f[i,i,a] <- pow(Q_f[i,i,a], -0.5)
+      Lambda_f[i,i,a] <- sig_f[i,a]
+      
+    }
+    for (i in 2:K){
+      for (j in 1:(i-1)){
+        Lambda_n[i,j,a] <- 0
+        Delta_n[i,j,a] <- 0
+        
+        Lambda_f[i,j,a] <- 0
+        Delta_f[i,j,a] <- 0
+      }
+    }
+    Sigma_n[1:K,1:K,a] <- Lambda_n[1:K,1:K,a] %*% P_n[1:K,1:K,a] %*% Lambda_n[1:K,1:K,a]
+        Q_n[1:K,1:K,a] ~ dinvwish(S = I_n[1:K,1:K,a], df = K + 1)
+        P_n[1:K,1:K,a] <- Delta_n[1:K,1:K,a] %*% Q_n[1:K,1:K,a] %*% Delta_n[1:K,1:K,a]
+    
+    Sigma_f[1:K,1:K,a] <- Lambda_f[1:K,1:K,a] %*% P_f[1:K,1:K,a] %*% Lambda_f[1:K,1:K,a]
+        Q_f[1:K,1:K,a] ~ dinvwish(S = I_f[1:K,1:K,a], df = K + 1)
+        P_f[1:K,1:K,a] <- Delta_f[1:K,1:K,a] %*% Q_f[1:K,1:K,a] %*% Delta_f[1:K,1:K,a]
+    
+    for (i in 1:K){
+      for (j in 1:K){
+        rho_n[i,j,a] <- Sigma_n[i,j,a]/sqrt(Sigma_n[i,i,a] * Sigma_n[j,j,a])
+        rho_f[i,j,a] <- Sigma_f[i,j,a]/sqrt(Sigma_f[i,i,a] * Sigma_f[j,j,a])
+      }
+    }
+  }  
+  
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+  # Residual error in natural mortality (n) and harvest (f) rates
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+  for (t in 1:(n.occasions)){
+    for(a in 1:n.sex){ 
+      eps_n[1:3,t,a] ~ dmnorm(mu_n[1:3,a], cov = Sigma_n[1:3, 1:3,a])
+      eps_f[1:3,t,a] ~ dmnorm(mu_f[1:3,a], cov = Sigma_f[1:3, 1:3,a])
+    }
+  }
+  # Informed prior for crippling rate
+  cr ~ dbeta(20,80)
+  
+  for(k in 1:n.region){
+    for(l in 1:n.sex){
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Priors for mean age-specific (HY,SY,ASY) mortality risk
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      log_sj[k,l] ~ dexp(1)
+      log_ss[k,l] ~ dexp(1)
+      log_sa[k,l] ~ dexp(1)
+      log_fj[k,l] ~ dexp(1)
+      log_fs[k,l] ~ dexp(1)
+      log_fa[k,l] ~ dexp(1)
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Specify annual variation in mortality risk
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      for (t in 1:n.occasions){
+        # Age-specific natural survivals for each region, k, and sex, l
+        nj[k,l,t] <- exp(-exp(log(log_sj[k,l]) + (eps_n[1,t,l])))
+        ns[k,l,t] <- exp(-exp(log(log_ss[k,l]) + (eps_n[2,t,l])))
+        na[k,l,t] <- exp(-exp(log(log_sa[k,l]) + (eps_n[3,t,l])))
+        # Age-specific annual survivals for each region, k, and sex, l
+        sj[k,l,t] <- exp(-(exp(log(log_sj[k,l]) + eps_n[1,t,l]) + exp(log(log_fj[k,l]) + eps_f[1,t,l])))
+        ss[k,l,t] <- exp(-(exp(log(log_ss[k,l]) + eps_n[2,t,l]) + exp(log(log_fs[k,l]) + eps_f[2,t,l])))
+        sa[k,l,t] <- exp(-(exp(log(log_sa[k,l]) + eps_n[3,t,l]) + exp(log(log_fa[k,l]) + eps_f[3,t,l])))
+        # Age-specific harvest rates for each region, k, and sex, l
+        kappa[1,k,l,t] <- (1 - (exp(-exp(log(log_fj[k,l]) + eps_f[1,t,l]))))
+        kappa[2,k,l,t] <- (1 - (exp(-exp(log(log_fs[k,l]) + eps_f[2,t,l]))))
+        kappa[3,k,l,t] <- (1 - (exp(-exp(log(log_fa[k,l]) + eps_f[3,t,l]))))
+        # Age-specific recovery probabilities for each region, k, and sex, l
+        f[1,k,l,t] <- rr[t] *  kappa[1,k,l,t] * (1 - cr)
+        f[2,k,l,t] <- rr[t] *  kappa[2,k,l,t] * (1 - cr)
+        f[3,k,l,t] <- rr[t] *  kappa[3,k,l,t] * (1 - cr)
+      }
+        # Constrain final year
+        nj[k,l,(n.occasions+1)]  <-        nj[k,l,(n.occasions)] 
+        ns[k,l,(n.occasions+1)]  <-        ns[k,l,(n.occasions)] 
+        na[k,l,(n.occasions+1)]  <-        na[k,l,(n.occasions)] 
+        sj[k,l,(n.occasions+1)]  <-        sj[k,l,(n.occasions)] 
+        ss[k,l,(n.occasions+1)]  <-        ss[k,l,(n.occasions)] 
+        sa[k,l,(n.occasions+1)]  <-        sa[k,l,(n.occasions)] 
+   kappa[1,k,l,(n.occasions+1)] <-    kappa[1,k,l,(n.occasions)]
+   kappa[2,k,l,(n.occasions+1)] <-    kappa[2,k,l,(n.occasions)]
+   kappa[3,k,l,(n.occasions+1)] <-    kappa[3,k,l,(n.occasions)]
+       f[1,k,l,(n.occasions+1)] <-        f[1,k,l,(n.occasions)]
+       f[2,k,l,(n.occasions+1)] <-        f[2,k,l,(n.occasions)]
+       f[3,k,l,(n.occasions+1)] <-        f[3,k,l,(n.occasions)] 
+    }
+  }
+  
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+  # Productivity and Abundance Models
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+  # North Slope and Canada Fecundity
+  for(j in 1:(n.region-1)){  
+   mu.theta[j] ~ dunif(0,4)
+  sig.theta[j] ~ T(dt(0, pow(2.5, -2), 1),0,)
+  }
+  
+  # Production priors
+  mu_ns ~ dbeta(8,2)    # mean nest success
+  mu_bp ~ dbeta(8,2)    # mean breeding propensity
+  mu_cs ~ dunif(0,6)    # mean clutch size
+  pre_surv ~ dbeta(8,2) # survival from hatch until banding
+
+# Production error terms
+     tau_ns ~ T(dt(0, pow(2.5, -2), 1),0,)
+     tau_bp ~ T(dt(0, pow(2.5, -2), 1),0,)
+     sig_cs ~ T(dt(0, pow(2.5, -2), 1),0,)
+     sig_gs ~ T(dt(0, pow(2.5, -2), 1),0,)
+  sig_nests ~ T(dt(0, pow(2.5, -2), 1),0,)
+  sig_ak_ns ~ T(dt(0, pow(2.5, -2), 1),0,)
+  
+  #Wrengel Island Productivity Model
+  for(t in 1:(n.occasions+1)){  
+    # Apparent nest survival [data]
+    nsurv[t] ~ dbeta(mu_ns * tau_ns, (1 - mu_ns) * tau_ns)
+    # Breeding Propensity [estimate]
+       bp[t] ~ dbeta(mu_bp * tau_bp, (1 - mu_bp) * tau_bp)
+    # Clutch Size [data]
+       cs[t] ~ T(dnorm(mu_cs, sd = sig_cs),0,)
+    # Number of nests [data]
+    nests[t] ~ T(dnorm(NAF[3,t] * bp[t], sd = sig_nests),0,)
+    # Gosling per brood [data]
+       gs[t] ~ T(dnorm( cs[t] * pre_surv, sd = sig_gs),0,)
+    # Number of HY 
+     NJ[3,t] <- (nests[t] * gs[t] * nsurv[t])
+     # HY per female ASY
+  theta[3,t] <-  NJ[3,t]/(NAF[3,t])                              # The number of goslings produced per adult female
+  
+  # Alaska Productivity Model
+  nsurv_ak[t] ~ dbeta(mu_ns * tau_ns, (1 - mu_ns) * tau_ns)
+     bp_ak[t] ~ dbeta(mu_bp * tau_bp, (1 - mu_bp) * tau_bp)  
+     
+  # Log-linear production model (intercept + error)
+    for(j in 1:(n.region-1)){  
+      eps_theta[j,t] ~ dnorm(log(mu.theta[j]), sd = sig.theta[j])
+    theta.prime[j,t] <- exp(eps_theta[j,t])                       # The number of goslings produced per breeding adult female
+             NJ[j,t] <- (theta[j,t] * NAF[j,t]) 
+    }
+     theta[1,t] <- theta.prime[1,t] *  nsurv_ak[t] *  bp_ak[t]    # The number of goslings produced per adult female
+     theta[2,t] <- theta.prime[2,t] *  mu_ns *  mu_bp             # The number of goslings produced per adult female
+  }
+  
+  # Link nest success/breeding propensity estimates to sparse Alaska nesting/brood rearing data
+  for(t in 23:24){
+    Igpik_NS[t] ~ T(dnorm(nsurv_ak[t], sd = sig_ak_ns),0,1)
+  }
+  for(t in 23:28){
+    Igpik_BR[t] ~ dbinom(bp_ak[t], Igpik_BR_NB[t])
+  }
+  for(t in 30:46){
+    Igpik_BR[t] ~ dbinom(bp_ak[t], Igpik_BR_NB[t])
+  }
+  for(t in 32:46){
+    Igpik_NS[t] ~ T(dnorm(nsurv_ak[t], sd = sig_ak_ns),0,1)
+  }
+  for(t in 42:49){
+    Col_NS[t] ~ T(dnorm(nsurv_ak[t], sd = sig_ak_ns),0,1)
+  }
+  
+  # Link production model to Alaska Brood Data
+  for(t in 11:n.occasions){
+    AK_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), AK_tot[t])
+  }
+  for(t in 11:22){
+    Ikp_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), Ikp_tot[t])
+  }
+  Ikp_juv[24] ~ dbinom( (theta.prime[1,24] )/(1 + (theta.prime[1,24] )), Ikp_tot[24])
+  for(t in 26:28){
+    Ikp_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), Ikp_tot[t])
+  }
+  Ikp_juv[30] ~ dbinom( (theta.prime[1,30] )/(1 + (theta.prime[1,30] )), Ikp_tot[30])
+  Ikp_juv[33] ~ dbinom( (theta.prime[1,33] )/(1 + (theta.prime[1,33] )), Ikp_tot[33])
+   for(t in 26:28){
+     Sag_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), Sag_tot[t])
+   }
+   for(t in 30:46){
+     Sag_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), Sag_tot[t])
+   }
+  for(t in 36:50){
+    Col_juv[t] ~ dbinom( (theta.prime[1,t] )/(1 + (theta.prime[1,t] )), Col_tot[t])
+  }
+   Col_juv[52] ~ dbinom( (theta.prime[1,52] )/(1 + (theta.prime[1,52] )), Col_tot[52])
+   
+  # Flyway-scale production model
+  for(t in 1:(n.occasions)){  
+    for(j in 1:n.region){   
+      # susceptibility-corrected predicted number of wings in PCS for each age-class
+      juv_wing[j,t] <- (NJ[j,t] * f[1,j,1,t] * .5  + NJ[j,t] * f[1,j,2,t] * .5) 
+      tot_wing[j,t] <- (NJ[j,t] * f[1,j,1,t] * .5  + NJ[j,t] * f[1,j,2,t] * .5 + N2F_fall[j,t] * f[2,j,1,t]  + N2M_fall[j,t] * f[2,j,2,t]  + N3F_fall[j,t] * f[3,j,1,t]  + N3M_fall[j,t] * f[3,j,2,t]) 
+      # Number of HY females produced
+      N1F_fall[j,t] <- NJ[j,t] * 0.5
+      # Number of HY males produced
+      N1M_fall[j,t] <- NJ[j,t] * 0.5
+      # Number of ASY avaiable for harvest
+      N2F_fall[j,t] <- NSF[j,t] * ns[j,1,t]^(1/3) 
+      N2M_fall[j,t] <- NSM[j,t] * ns[j,2,t]^(1/3)
+      # Number of ATY avaiable for harvest
+      N3F_fall[j,t] <- NAF[j,t] * na[j,1,t]^(1/3)
+      N3M_fall[j,t] <- NAM[j,t] * na[j,2,t]^(1/3)
+    }
+    # Predicted fall age-ratio [flyway-scale]
+    pr_juv[t] <- sum((juv_wing[1:3,t]))/sum(tot_wing[1:3,t])
+    
+    # Predicted number of individuals harvested
+    NJ_lincoln[t] <- (((N1F_fall[1:3, t] %*%  kappa[1,1:3,1,t])[1,1] + (N1M_fall[1:3, t] %*%  kappa[1,1:3,2,t])[1,1] )  * rr[t] )/hc
+    NA_lincoln[t] <- (((N2F_fall[1:3, t] %*%  kappa[2,1:3,1,t])[1,1] + (N2M_fall[1:3, t] %*%  kappa[2,1:3,2,t])[1,1]  +
+                       (N3F_fall[1:3, t] %*%  kappa[3,1:3,1,t])[1,1] + (N3M_fall[1:3, t] %*%  kappa[3,1:3,2,t])[1,1] )  * rr[t] )/hc
+  }
+  
+  # Lincoln and flyway-scale productivity likelihoods
+  for(t in 1:(n.occasions)){  
+       H_J[t] ~ dnorm(NJ_lincoln[t], sd = sig_lincoln[1])
+       H_A[t] ~ dnorm(NA_lincoln[t], sd = sig_lincoln[2])
+    wing_j[t] ~ dbinom(pr_juv[t], wing_j_a[t]) 
+  }
+  
+  # Harvest Correction factor (see Padding and Royle 201x)
+  hc <- 0.73
+  
+  # Immigration model
+  for(j in 1:n.region){
+     mu_imm[j] ~ dunif(0, .5)
+    sig_imm[j] ~ T(dt(0, pow(2.5, -2), 1),0,)
+    for(t in 1:n.occasions){
+      N_imm[j,t] ~ T(dnorm(mu_imm[j], sd = sig_imm[j]),0,)
+    }
+  }
+  
+  # Starting SY and ASY abundance for each breeding population
+  NSF[1,1] ~ dunif(0,0.01)
+  NSM[1,1] ~ dunif(0,0.01)
+  NAF[1,1] ~ dunif(0,0.01)
+  NAM[1,1] ~ dunif(0,0.01)
+  
+  NSF[2,1] ~ dunif(0.25,1)
+  NSM[2,1] ~ dunif(0.25,1)
+  NAF[2,1] ~ dunif(0.25,1)
+  NAM[2,1] ~ dunif(0.25,1)
+  
+  NSF[3,1] ~ dunif(0,0.75)
+  NSM[3,1] ~ dunif(0,0.75)
+  NAF[3,1] ~ dunif(0,0.75)
+  NAM[3,1] ~ dunif(0,0.75)
+  
+  # State-space abundance model
+  for(j in 1:n.region){
+    for(t in 2:(n.occasions+1)){
+      NSF[j,t] <- N1F_fall[j,t-1] * sj[j,1,t-1]
+      NSM[j,t] <- N1M_fall[j,t-1] * sj[j,2,t-1]
+      NAF[j,t] <- (NSF[j,t-1] * ss[j,1,t-1]) + (NAF[j,t-1] * sa[j,1,t-1]) + N_imm[j,t-1]
+      NAM[j,t] <- (NSM[j,t-1] * ss[j,2,t-1]) + (NAM[j,t-1] * sa[j,2,t-1]) + N_imm[j,t-1]
+    }
+  }
+  # Total number of adults and second-year recruits
+  for(t in 1:(n.occasions+1)){  
+    for(j in 1:3){
+        N_Adults[j,t] <- NAF[j,t] + NAM[j,t]
+      N_Recruits[j,t] <- NSF[j,t] + NSM[j,t]
+    }
+    
+    # Link abundance estimates to colony census data
+      EggN[t] ~ T(dnorm( ( NAF[2,t] + NAM[2,t] +  NSF[2,t] + NSM[2,t]) * pi[1]      , sd = sigma.N[1]),0,) 
+      KenN[t] ~ T(dnorm( ( NAF[2,t] + NAM[2,t] +  NSF[2,t] + NSM[2,t]) * pi[2]      , sd = sigma.N[2]),0,)
+      AndN[t] ~ T(dnorm( ( NAF[2,t] + NAM[2,t] +  NSF[2,t] + NSM[2,t]) * pi[3]      , sd = sigma.N[3]),0,)
+     
+      IkpN[t] ~ T(dnorm( ( NAF[1,t] + NAM[1,t] ) * xi[1]  , sd = sigma.N[4]) ,0,) 
+      SagN[t] ~ T(dnorm( ( NAF[1,t] + NAM[1,t] ) * xi[2]  , sd = sigma.N[5]) ,0,)
+      ColN[t] ~ T(dnorm( ( NAF[1,t] + NAM[1,t] ) * xi[3]  , sd = sigma.N[6]) ,0,)
+  
+      WreN[t] ~ T(dnorm(   NAF[3,t] + NAM[3,t] +  NSF[3,t] + NSM[3,t]               , sd = sigma.N[7]) ,0,)
+  }
+  # Distribution of regional breeding population to sub-regional colonies
+  pi[1:3] ~ ddirch(alpha[1:3])    # Canada
+  xi[1:3] ~ ddirch(alpha_ns[1:3]) # Alaska
+for(s in 1:7){
+  sigma.N[s] ~ dexp(1)
+}
+ # Arctic Coastal Plain model
+  for(t in 38:50){  
+    ACP_t[t] ~ dnorm( (NAF[1,t] + NAM[1,t] +  NSF[1,t] + NSM[1,t]), sd = ACP_error_t[t])
+  }
+  
+  for(t in 53){  
+    ACP_t[t] ~ dnorm( (NAF[1,t] + NAM[1,t] +  NSF[1,t] + NSM[1,t]), sd = ACP_error_t[t])
+  }
+  # Lincoln error term
+  for(s in 1:2){
+    sig_lincoln[s] ~ dexp(1)
+  }
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+  for(k in 1:n.region){  
+    for(l in 1:n.sex){
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#   
+      # Derive mean estimate for each survival/recovery rate
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      mean_sj[k,l] <-  exp(-log_sj[k,l])
+      mean_ss[k,l] <-  exp(-log_ss[k,l])
+      mean_sa[k,l] <-  exp(-log_sa[k,l])
+      mean_fj[k,l] <- 1 - exp(-log_fj[k,l])
+      mean_fs[k,l] <- 1 - exp(-log_fs[k,l])
+      mean_fa[k,l] <- 1 - exp(-log_fa[k,l])
+    }
+  }
+  
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+  # Mark-recovery likelihood
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+  for(k in 1:n.region){
+    for(l in 1:n.sex){
+      for (t in 1:n.occasions){
+        marr.j[t,1:(n.occasions+1),k,l] ~ dmulti(pr.j[t,1:(n.occasions+1),k,l], rel.j[t,k,l])
+        marr.s[t,1:(n.occasions+1),k,l] ~ dmulti(pr.s[t,1:(n.occasions+1),k,l], rel.s[t,k,l])
+        marr.a[t,1:(n.occasions+1),k,l] ~ dmulti(pr.a[t,1:(n.occasions+1),k,l], rel.a[t,k,l])
+      }
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Define the cell probabilities of the juvenile m-array
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Main diagonal
+      for (t in 1:n.occasions){
+        pr.j[t,t,k,l] <- f[1,k,l,t]
+        # Further above main diagonal
+        for (j in (t+3):n.occasions){
+          pr.j[t,j,k,l] <- sj[k,l,t]*ss[k,l,t+1]*prod(sa[k,l,(t+2):(j-1)])*f[3,k,l,j]
+        } #j
+        # Below main diagonal
+        for (j in 1:(t-1)){
+          pr.j[t,j,k,l] <- 0
+        } #j
+      } #t
+      
+      for (t in 1:(n.occasions-1)){
+        # One above main diagonal
+        pr.j[t,t+1,k,l] <- sj[k,l,t]*f[2,k,l,t+1]
+      } #t
+      
+      for (t in 1:(n.occasions-2)){
+        # One above main diagonal
+        pr.j[t,t+2,k,l] <-sj[k,l,t] * ss[k,l,t+1] * f[3,k,l,t+2]
+      } #t
+      
+      # Last column: probability of non-recovery
+      for (t in 1:n.occasions){
+        pr.j[t,n.occasions+1,k,l] <- 1-sum(pr.j[t,1:n.occasions,k,l])
+      } #t
+      
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Define the cell probabilities of the sub-adult m-array
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      
+      # Main diagonal
+      for (t in 1:n.occasions){
+        pr.s[t,t,k,l] <- f[2,k,l,t]
+        # Further above main diagonal
+        for (j in (t+2):n.occasions){
+          pr.s[t,j,k,l] <- ss[k,l,t]*prod(sa[k,l,(t+2):(j-1)])*f[3,k,l,j]
+        } #j
+        # Below main diagonal
+        for (j in 1:(t-1)){
+          pr.s[t,j,k,l] <- 0
+        } #j
+      } #t
+      
+      for (t in 1:(n.occasions-1)){
+        # One above main diagonal
+        pr.s[t,t+1,k,l] <- ss[k,l,t]*f[3,k,l,t+1]
+      } #t
+      
+      # Last column: probability of non-recovery
+      for (t in 1:n.occasions){
+        pr.s[t,n.occasions+1,k,l] <- 1-sum(pr.s[t,1:n.occasions,k,l])
+      } #t
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#   
+      # Define the cell probabilities of the adult m-array
+      #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#  
+      # Main diagonal
+      for (t in 1:n.occasions){
+        pr.a[t,t,k,l] <-f[3,k,l,t]
+        # Above main diagonal
+        for (j in (t+1):n.occasions){
+          pr.a[t,j,k,l] <- prod(sa[k,l,t:(j-1)])*f[3,k,l,j]
+        } #j
+        # Below main diagonal
+        for (j in 1:(t-1)){
+          pr.a[t,j,k,l] <- 0
+        } #j
+      } #t
+      # Last column: probability of non-recovery
+      for (t in 1:n.occasions){
+        pr.a[t,n.occasions+1,k,l] <- 1-sum(pr.a[t,1:n.occasions,k,l])
+      } #t
+    }
+  }
+  
+  
+  
+})
+
+
+AK_AD <- apply(apply(marr_ad[,,1,], c(1,3), sum),1,max)
+
+# Bundle data
+nimble.data <- list(marr.j = marr_hy,marr.s = marr_sy, marr.a = marr_ad,
+                    wing_j = wing_j, wing_j_a = wing_j_a,H_A=H_A,H_J=H_J, 
+                    nests = nests/100000, nsurv = ns.edit, cs = cs, gs = gs,
+                    Col_juv = as.numeric(ak_gosling[,1]), Col_tot = as.numeric(ak_gosling[,1] + ak_adults_round[,1]),
+                    Ikp_juv = as.numeric(ak_gosling[,2]), Ikp_tot = as.numeric(ak_gosling[,2] + ak_adults_round[,2]),
+                    Sag_juv = as.numeric(ak_gosling[,3]), Sag_tot = as.numeric(ak_gosling[,3] + ak_adults_round[,3]),
+                    AK_juv = AK_HY, AK_tot = AK_HY + AK_AD,
+                    rel.j = apply(marr_hy, c(1,3:4), sum),  rel.s = apply(marr_sy, c(1,3:4), sum), rel.a = apply(marr_ad, c(1,3:4), sum),
+                    I_f = abind(diag(3),diag(3),along = 3), I_n = abind(diag(3),diag(3),along = 3),
+                    RR.rr = MU_R, SD.rr = SD_R,
+                    EggN = Total_N_100k[,1], KenN = Total_N_100k[,2], AndN = Total_N_100k[,3],
+                    IkpN = Total_N_100k[,4], SagN = Total_N_100k[,5], ColN = Total_N_100k[,6],
+                    WreN = Total_N_100k[,7],
+                    ACP_t =  Total_N_100k[,8], ACP_error_t =  Total_N_100k[,9], 
+                    ACP_b =  Total_N_100k[,10], ACP_error_b =  Total_N_100k[,11],
+                    Igpik_BR = Igpik_BR, Igpik_BR_NB = Igpik_NB + Igpik_BR, Col_NS= Col_NS ,Igpik_NS=Igpik_NS )
+
+nimble.constants<- list(n.occasions = dim(marr_hy)[2]-1,n.region =3, n.sex = 2, K = 3,n.age_class = 3, alpha = c(1,1,1),alpha_ns = c(1,1,1))
+
+# Generate initial values
+EggN.inits = Total_N_100k[,1]
+KenN.inits = Total_N_100k[,2]
+AndN.inits = Total_N_100k[,3]
+IkpN.inits = Total_N_100k[,4]
+SagN.inits = Total_N_100k[,5]
+ColN.inits = Total_N_100k[,6]
+WreN.inits = Total_N_100k[,7]
+
+  EggN.inits[1] <- min(EggN.inits, na.rm = TRUE)
+  KenN.inits[1] <- min(KenN.inits, na.rm = TRUE)
+  AndN.inits[1] <- min(AndN.inits, na.rm = TRUE)
+  IkpN.inits[1] <- 0
+  SagN.inits[1] <- 0
+  ColN.inits[1] <- 0
+
+  for(t in 2:53){
+    EggN.inits[t] <- ifelse(is.na(EggN.inits[t]) == TRUE, EggN.inits[t-1], EggN.inits[t])
+    KenN.inits[t] <- ifelse(is.na(KenN.inits[t]) == TRUE, KenN.inits[t-1], KenN.inits[t])
+    AndN.inits[t] <- ifelse(is.na(AndN.inits[t]) == TRUE, AndN.inits[t-1], AndN.inits[t])
+    IkpN.inits[t] <- ifelse(is.na(IkpN.inits[t]) == TRUE, IkpN.inits[t-1], IkpN.inits[t])
+    SagN.inits[t] <- ifelse(is.na(SagN.inits[t]) == TRUE, SagN.inits[t-1], SagN.inits[t])
+    ColN.inits[t] <- ifelse(is.na(ColN.inits[t]) == TRUE, ColN.inits[t-1], ColN.inits[t])
+    WreN.inits[t] <- ifelse(is.na(WreN.inits[t]) == TRUE, WreN.inits[t-1], WreN.inits[t])
+  }
+  
+ns.inits     <- ns.edit
+cs.inits     <- cs
+gs.inits     <- gs
+nests.inits  <- nests
+
+ns.inits    <- ifelse(is.na(ns.inits   ) == TRUE, median(ns.inits   ,na.rm = TRUE), ns.inits   )
+cs.inits    <- ifelse(is.na(cs.inits   ) == TRUE, median(cs.inits   ,na.rm = TRUE), cs.inits   )
+gs.inits    <- ifelse(is.na(gs.inits   ) == TRUE, median(gs.inits   ,na.rm = TRUE), gs.inits   )
+nests.inits <- ifelse(is.na(nests.inits) == TRUE, median(nests.inits,na.rm = TRUE), nests.inits)
+
+initsFunction <- function()list(log_sj = matrix(.5,3,2),log_ss = matrix(.25,3,2),  log_sa = matrix(.15,3,2), 
+                                log_fj = matrix(.1,3,2),log_fs = matrix(.075,3,2), log_fa = matrix(.05,3,2), 
+                                cr  = .2, rr = MU_R, zeta_n = c(1,1), zeta_f = c(1,1),post_surv = .8,
+                                mu_bs = .8, tau_bs = .025, bs = matrix(c(.8,1),2,53),
+                                sig_nests  = .1, tau_theta = 1, sig_ak_ns = .1,
+                                mu_ns = .65, mu_bp = .8, mu_cs =  4,pre_surv = .8,mu.theta = c(2,2),bp = rep(.8,dim(marr_hy)[2]),
+                                tau_ns = 10,tau_bp = 10,sig_cs = .1,sig_gs = .1,sig.theta = c(.25,.25),
+                                mu_imm = c(.0005,0.0025, 0.0025), sig_imm = c(0.0001,0.0001,0.0001), 
+                                N_imm = matrix(c(0.005,0.025,0.025), nrow = 3, ncol = dim(marr_hy)[2], byrow = FALSE),
+                                sig_lincoln = c(.02,.02), sigma.N = rep(.2,7), pi = c(.95,.025,.025), xi = c(.4,.1,.5), nu.theta = c(0,0,0), 
+                                Lambda_n = Lambda, Delta_n = Delta, P_n = P, Q_n = Q, Sigma_n = Sigma, sig_n = matrix(.25,3,2),
+                                Lambda_f = Lambda, Delta_f = Delta, P_f = P, Q_f = Q, Sigma_f = Sigma, sig_f = matrix(.25,3,2),
+                                eps_n = array(0, dim = c(3,dim(marr_hy)[2]-1,2)), eps_f = array(0, dim = c(3,dim(marr_hy)[2]-1,2)),
+                                EggN = EggN.inits,KenN = KenN.inits,AndN = AndN.inits,IkpN = IkpN.inits,SagN = SagN.inits,ColN = ColN.inits,WreN = WreN.inits)  
+
+# Parameters monitored
+parameters <- c("mean_sj", "mean_fj", "mean_ss", "mean_fs", "mean_sa", "mean_fa",'sj','sa','ss','f','rho','rho_f')
+
+# Initial values
+nimble.inits <- initsFunction() 
+
+library(parallel)
+library(coda)
+
+nc      <- 3 # number of chains
+cluster_id <-makeCluster(nc,timeout=5184000)
+clusterExport(cluster_id, c("nimble_model", "nimble.inits", "nimble.data", "nimble.constants"))
+
+for (j in seq_along(cluster_id)) {
+  nimble.inits <- initsFunction() 
+  clusterExport(cluster_id[j], "nimble.inits")
+}
+
+out <- clusterEvalQ(cluster_id, {
+  library(nimble)
+  library(coda)
+  
+  nimble.model <- nimbleModel( code = nimble_model, constants = nimble.constants,  dat =  nimble.data, inits = nimble.inits)
+  
+  nimble.model$initializeInfo()
+  
+  nimble.model$simulate(c('nsurv','cs','lifted_NAF_oB3_comma_t_cB_times_bp_oBt_cB_L92','nests','lifted_nsurv_oBt_cB_times_cs_oBt_cB_times_pre_surv_L93','gs','NJ','theta','nsurv_ak','bp_ak','eps_theta','theta.prime','Igpik_NS','Igpik_BR','Col_NS','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L115','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L117','Ikp_juv','lifted_oPtheta_dot_prime_oB1_comma_24_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_24_cB_cP_cP','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L120','lifted_oPtheta_dot_prime_oB1_comma_30_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_30_cB_cP_cP','lifted_oPtheta_dot_prime_oB1_comma_33_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_33_cB_cP_cP','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L124','Sag_juv','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L126','lifted_oPtheta_dot_prime_oB1_comma_t_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_t_cB_cP_cP_L128','Col_juv','lifted_oPtheta_dot_prime_oB1_comma_52_cB_cP_over__oP1_plus__oPtheta_dot_prime_oB1_comma_52_cB_cP_cP','juv_wing','tot_wing','N1F_fall','N1M_fall','N2F_fall','N2M_fall','N3F_fall','N3M_fall','pr_juv','NJ_lincoln','NA_lincoln','NSF','NSM','NAF','NAM','N_Adults','N_Recruits','lifted_oPNAF_oB2_comma_t_cB_plus_NAM_oB2_comma_t_cB_plus_NSF_oB2_comma_t_cB_plus_NSM_oB2_comma_t_cB_cP_times_pi_oB1_cB_L175','lifted_oPNAF_oB2_comma_t_cB_plus_NAM_oB2_comma_t_cB_plus_NSF_oB2_comma_t_cB_plus_NSM_oB2_comma_t_cB_cP_times_pi_oB2_cB_L176','lifted_oPNAF_oB2_comma_t_cB_plus_NAM_oB2_comma_t_cB_plus_NSF_oB2_comma_t_cB_plus_NSM_oB2_comma_t_cB_cP_times_pi_oB3_cB_L177','lifted_oPNAF_oB1_comma_t_cB_plus_NAM_oB1_comma_t_cB_cP_times_xi_oB1_cB_L178','lifted_oPNAF_oB1_comma_t_cB_plus_NAM_oB1_comma_t_cB_cP_times_xi_oB2_cB_L179','lifted_oPNAF_oB1_comma_t_cB_plus_NAM_oB1_comma_t_cB_cP_times_xi_oB3_cB_L180','lifted_NAF_oB3_comma_t_cB_plus_NAM_oB3_comma_t_cB_plus_NSF_oB3_comma_t_cB_plus_NSM_oB3_comma_t_cB_L181','lifted_oPNAF_oB1_comma_t_cB_plus_NAM_oB1_comma_t_cB_plus_NSF_oB1_comma_t_cB_plus_NSM_oB1_comma_t_cB_cP_L187','ACP_t','lifted_oPNAF_oB1_comma_t_cB_plus_NAM_oB1_comma_t_cB_plus_NSF_oB1_comma_t_cB_plus_NSM_oB1_comma_t_cB_cP_L189','Igpik_BR_NB','Ikp_tot','Sag_tot','Col_tot','ACP_error_t'))
+  
+  nimble.model$calculate()
+
+  Cmodel     <- compileNimble(nimble.model)
+  
+  mcmc_Conf  <- configureMCMC(nimble.model, useConjugacy = FALSE,  thin = 2, thin2 = 5,
+                              monitors  = c("mean_sj", "mean_fj", "mean_ss", "mean_fs", "mean_sa", "mean_fa",'mu_bp','mu_cs',
+                                            'rho_n','rho_f','zeta_n','zeta_f','sig_n','sig_f', 'pi','bp','mu.theta','mu_imm',
+                                            'pre_surv','mu_ns','xi',
+                                            'log_sj','log_sa','log_fj','log_fa','log_fs','log_ss','sig_lincoln','sigma.N'),
+                              monitors2 = c('sj','ss', 'sa','f','kappa','na','ns','nj','theta', 'NSF','NSM','NAF','NAM', 'bp','nsurv','nests','gs','cs','N_imm','theta.prime','nsurv_ak','bp_ak',
+                                            'EggN','KenN','AndN','IkpN','SagN','ColN','WreN','N_Adults', 'N_Recruits')
+  )
+  
+  mcmc_Conf$removeSamplers(c('log_sj','log_ss', 'log_sa','log_fj','log_fs', 'log_fa'))
+  mcmc_Conf$addSampler(target = c('log_sj[1,1]','log_fj[1,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sj[2,1]','log_fj[2,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sj[3,1]','log_fj[3,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  mcmc_Conf$addSampler(target = c('log_sj[1,2]','log_fj[1,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sj[2,2]','log_fj[2,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sj[3,2]','log_fj[3,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  mcmc_Conf$addSampler(target = c('log_ss[1,1]','log_fs[1,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_ss[2,1]','log_fs[2,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_ss[3,1]','log_fs[3,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  mcmc_Conf$addSampler(target = c('log_ss[1,2]','log_fs[1,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_ss[2,2]','log_fs[2,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_ss[3,2]','log_fs[3,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  mcmc_Conf$addSampler(target = c('log_sa[1,1]','log_fa[1,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sa[2,1]','log_fa[2,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sa[3,1]','log_fa[3,1]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  mcmc_Conf$addSampler(target = c('log_sa[1,2]','log_fa[1,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sa[2,2]','log_fa[2,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  mcmc_Conf$addSampler(target = c('log_sa[3,2]','log_fa[3,2]'), type = 'AF_slice', control=list(sliceAdaptFactorMaxIter=50000, sliceAdaptFactorInterval=1000, sliceAdaptWidthMaxIter=500, sliceMaxSteps=200, maxContractions=100))
+  
+  
+  modelMCMC  <- buildMCMC(mcmc_Conf)
+  CmodelMCMC <- compileNimble(modelMCMC,project = nimble.model)
+  
+  CmodelMCMC$run(50000, thin = 2, thin2 = 5, reset = FALSE)
+  
+  return(list( as.mcmc(as.matrix(CmodelMCMC$mvSamples)),
+               as.mcmc(as.matrix(CmodelMCMC$mvSamples2))))
+  
+})
+end_time <- Sys.time()
+end_time - start_time
+
+samples1 <- list(chain1 = out[[1]][[1]][-c(1:5001),], 
+                 chain2 = out[[2]][[1]][-c(1:5001),], 
+                 chain3 = out[[3]][[1]][-c(1:5001),])
+
+samples2    <- list(chain1 =   out[[1]][[2]][-c(1:2001),], 
+                    chain2 =   out[[2]][[2]][-c(1:2001),], 
+                    chain3 =   out[[3]][[2]][-c(1:2001),])
+
+mcmcList1 <- as.mcmc.list(lapply(samples1, mcmc))
+mcmcList2 <- as.mcmc.list(lapply(samples2, mcmc))
+
+###################
+
+library(MCMCvis)
+library(ggplot2)
+library(ggdist)
+library(see)
+library(dplyr)
+library(abind)
+library(ggpubr)
+library(reshape)
+
+
+bp <- MCMCsummary(mcmcList2, params = 'bp_ak')
+
+bp_wren <- cbind.data.frame(bp, expand.grid(Region = c("Wrengel Island"), Year = 1970:2022))
+
+
+fig_bp <- bp_wren  %>%
+  ggplot(aes(x = Year, y = mean)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`, fill = Region),color = 'black', position = position_dodge2(1),  shape  =21, size = .66) + 
+  labs(y = 'Breeding Propensity',x ='') +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_bp
+
+
+
+theta <- MCMCsummary(mcmcList2, params = 'theta')
+
+theta <- cbind.data.frame(theta, expand.grid(Region = c('Alaska','Canada',"Wrengel"), Year = 1970:2022))
+
+
+fig_ar <- theta  %>% subset(Year != 1970 ) %>%
+  ggplot(aes(x = Year, y = mean)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`, fill = Region), color = 'black', shape  =21, size = .75) + 
+  geom_smooth(aes(x = Year, y = mean, color = Region), se = FALSE) +
+  labs(y = 'Juveniles per Female',x ='') +
+  scale_fill_see_d() + scale_color_see_d()+ facet_wrap(~Region)+
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_ar
+
+ggsave(fig_ar, file = 'fig_ar.jpg', height = 8, width = 16, dpi = 640)
+
+N_Adults <- MCMCsummary(mcmcList2, params = 'N_Adults')
+
+N_Adults <- cbind.data.frame(N_Adults, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'), Year = 1970:2022), Age = 'After Second-Year')
+
+fig_N <- N_Adults  %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean * 100,  fill = Region)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean* 100, ymin = `2.5%`* 100, ymax = `97.5%`* 100,fill = Region), color = 'black', shape  =21, size = .66, position = position_dodge2(.35)) + 
+  labs(y = 'Number of adults (x 1,000)',x ='') +
+  scale_fill_see_d() + facet_wrap(~Region, scales = 'free_y') +
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'none') 
+fig_N
+
+N_Recruits <- MCMCsummary(mcmcList2, params = 'N_Recruits')
+
+N_Recruits <- cbind.data.frame(N_Recruits, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'), Year = 1970:2022), Age = 'Second-Year')
+
+fig_R <- N_Recruits  %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean* 100,  fill = Region)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean* 100, ymin = `2.5%`* 100, ymax = `97.5%`* 100,fill = Region), color = 'black', shape  =21, size = .66, position = position_dodge2(.35)) + 
+  labs(y = 'Number of Recruits (x 1,000)',x ='') +
+  scale_fill_see_d() + facet_wrap(~Region, scales = 'free_y') +
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'none') 
+fig_R
+
+
+N_tot <- rbind.data.frame(N_Adults,N_Recruits)
+
+
+N_age <- N_tot %>%
+  ggplot(aes(x = Year, y = mean*100, fill = Age))+
+  geom_bar(stat = "identity")+ 
+  scale_fill_metro_d() + facet_wrap(~Region, scales = 'free') +
+  labs(y = 'Regional Spring Abundance (x 1000)', x = 'Year') +
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+N_age
+
+ggsave(N_age, file = 'N_age.jpg', height = 8, width = 16, dpi = 640)
+
+#################
+library(reshape2)
+iter = dim(MCMCpstr(mcmcList2, params = 'N_Adults', type = 'chains')$N_Adults)[3]
+year <- 1970:2022
+N_est <- MCMCpstr(mcmcList2, params = 'N_Adults', type = 'chains')$N_Adults 
+N_AK <- melt(N_est[1,,])
+N_AK$year <-rep(year, times = iter)
+N_AK$Pop <- 'Alaska'
+
+N_NO <- melt(N_est[2,,])
+N_NO$year <-rep(year, times = iter)
+N_NO$Pop <- 'Canada'
+
+N_PR <- melt(N_est[3,,])
+N_PR$year <-rep(year, times = iter)
+N_PR$Pop <- 'Wrengel'
+
+
+N_AD <- rbind.data.frame(N_AK,N_NO,N_PR)
+
+SY_est <- MCMCpstr(mcmcList2, params = 'N_Recruits', type = 'chains')$N_Recruits 
+SY_AK <- melt(SY_est[1,,])
+SY_AK$year <-rep(year, times = iter)
+SY_AK$Pop <- 'Alaska'
+
+SY_NO <- melt(SY_est[2,,])
+SY_NO$year <-rep(year, times = iter)
+SY_NO$Pop <- 'Canada'
+
+SY_PR <- melt(SY_est[3,,])
+SY_PR$year <-rep(year, times = iter)
+SY_PR$Pop <- 'Wrengel'
+
+
+N_SY <- rbind.data.frame(SY_AK,SY_NO,SY_PR)
+
+N_Total <- N_AD
+N_Total$value <- (N_Total$value+N_SY$value) * 100
+
+
+library(MCMCvis)
+library(tidybayes )
+fig_total <- N_Total  %>%
+  ggplot(aes(x = year, y = value, fill = Pop,color =Pop)) + #, fill = stat(.width))) +
+  stat_lineribbon(.width = c(.5,.80, .95), color = 'black', size = .67, alpha = .25) + 
+  labs(y = 'Regional Spring Abundance [SY + ASY] (x 1000)',x ='', fill = 'Region', color = 'Region') + 
+  scale_fill_metro_d() + scale_color_metro_d()  + facet_wrap(~Pop, scales = 'free_y')+
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'none') 
+fig_total
+
+ggsave(fig_total, file = 'total_spring_N.jpg', height = 8, width = 16, dpi = 640)
+
+
+
+mw <- c(461676,513221,436716,343445,443138,446540,487078,507347,236681,247001,378252,448094,660549,445064,525945,371046,557223,335586,345101,411411,572118,564480,428648,434304,
+          550269,390243,411665,534457,336290,487854,646014,546429,399169,474330,451677,795928,553993,734415,875215,852666,713997,628433,848375,776353)
+
+
+wg <- c(528100,204200,759900,354100,547600,466300,549800,521700,525300,441000,463900,708500,690100,639300,569200,478200,501400,366300,416400,
+        354300,579000,656800,448200,596800,587800,750269,710726,799701,1073481,957403,901019,863797,1097851,881405,1351203,1199586,NA,1906788,1355202,1413764,1599641)
+
+
+wg_sur <- cbind.data.frame(year = 1979:2019, est = wg)
+
+N_All <- N_Total %>% group_by(year,Var2) %>% summarize_at('value',sum) %>%
+  ggplot(aes(x = year, y = value)) + #, fill = stat(.width))) +
+  stat_lineribbon(.width = c(.5,.80, .95), color = 'black',fill = '#1ba1e2', size = .67, alpha = .25) + 
+  labs(y = 'West Arctic Spring Abundance [SY + ASY] (x 1000)',x ='', fill = 'Region', color = 'Region') + 
+  scale_fill_metro_d() + scale_color_metro_d() +
+  geom_point(data = wg_sur, aes(x = year + .5, y = est/1000), size= 2, color = 'red') +
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'none') 
+N_All
+
+ggsave(N_All, file = 'total_N_mw.jpg', height = 9, width = 9, dpi = 640)
+#################
+adult_survival <- MCMCsummary(mcmcList2, params = 'na')
+
+adult_survival <- cbind.data.frame(adult_survival, expand.grid(Region = c('North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022))
+
+fig_1a <- adult_survival  %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'ASY Natural Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_1a
+
+sub_survival <- MCMCsummary(mcmcList2, params = 'ns')
+
+sub_survival <- cbind.data.frame(sub_survival, expand.grid(Region = c('North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022))
+
+fig_2a <- sub_survival  %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'SY Natural Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_2a
+
+juv_survival <- MCMCsummary(mcmcList2, params = 'nj')
+
+juv_survival <- cbind.data.frame(juv_survival, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022))
+
+fig_3a <- juv_survival  %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'HY Natural Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_3a
+
+surv_fig <- ggarrange(fig_3a,fig_2a,fig_1a, labels = c('(a)','(b)','(c)'), common.legend = TRUE,ncol = 3)
+
+ggsave(surv_fig, height = 9, width = 18, dpi = 640, file = 'natural_survival.jpg')
+################
+
+recovery_rates <- MCMCsummary(mcmcList2, params = 'f')
+
+recovery_rates <- cbind.data.frame(recovery_rates, expand.grid(Age = c('HY','SY', 'ASY'), Region = c('North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1971:2022))
+
+fig_1a <- recovery_rates  %>%
+  ggplot(aes(x = Year, y = mean,  fill = Region)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Region), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) +
+  coord_cartesian(ylim = c(0, 0.15))+
+  labs(y = 'Direct Recovery Rates',x ='') + facet_wrap(Age~Sex, ncol = 2) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_1a
+
+recovery_rates <- MCMCsummary(mcmcList2, params = 'kappa')
+
+recovery_rates <- cbind.data.frame(recovery_rates, expand.grid(Age =  c('HY','SY', 'ASY'), Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022))
+
+fig_1a <- recovery_rates  %>%
+  ggplot(aes(x = Year, y = mean,  fill = Region)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Region), color = 'black', shape  =21, size = .5, position = position_dodge2(1)) +
+  coord_cartesian(ylim = c(0, 0.50))+
+  labs(y = 'Harvest Rates',x ='') + facet_wrap(Age~Sex, ncol = 2) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 20, axis.title.size = 20, legend.text.size = 20, legend.title.size = 20, legend.position = 'top') 
+fig_1a
+
+
+fig_1a <- recovery_rates  %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .5, linetype = 'dashed',position = position_dodge2(1)) +
+  coord_cartesian(ylim = c(0, 0.5))+
+  labs(y = 'Harvest Rates',x ='') + facet_wrap(Region~Age, ncol = 3) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 20, axis.title.size = 20, legend.text.size = 20, legend.title.size = 20, legend.position = 'top') 
+fig_1a
+
+ggsave(fig_1a, file = 'harvest_rates.png', dpi = 640, height = 12, width = 12)
+
+ggsave(fig_1a, height = 8, width = 16, dpi = 640, file = 'harvest_rates.jpg')
+
+adult_survival <- MCMCsummary(mcmcList2, params = 'sa')
+
+adult_survival <- cbind.data.frame(adult_survival, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022, Age = 'ASY'))
+
+fig_1a <- adult_survival  %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'ASY Annual Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_1a
+
+sub_survival <- MCMCsummary(mcmcList2, params = 'ss')
+
+sub_survival <- cbind.data.frame(sub_survival, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022, Age = 'SY'))
+
+fig_2a <- sub_survival   %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'SY Annual Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_2a
+
+juv_survival <- MCMCsummary(mcmcList2, params = 'sj')
+
+juv_survival <- cbind.data.frame(juv_survival, expand.grid(Region = c( 'North Slope', 'Canadian West Arctic','Wrengel'),Sex = c('Female', "Male"), Year = 1970:2022, Age = 'HY'))
+
+fig_3a <- juv_survival   %>% subset(Year != 1970) %>%
+  ggplot(aes(x = Year, y = mean,  fill = Sex)) + #, fill = stat(.width))) +
+  geom_pointrange2(aes(x = Year, y = mean, ymin = `2.5%`, ymax = `97.5%`,fill = Sex), color = 'black', shape  =21, size = .66, position = position_dodge2(1)) + coord_cartesian(ylim = c(0, 1))+
+  labs(y = 'HY Annual Survival',x ='') + facet_wrap(~Region, ncol = 1) +
+  scale_fill_see_d() + 
+  theme_modern(base_size = 14, axis.title.size = 16, legend.text.size = 16, legend.title.size = 16, legend.position = 'top') 
+fig_3a
+
+library(ggpubr)
+surv_fig <- ggarrange(fig_3a,fig_2a,fig_1a, labels = c('(a)','(b)','(c)'), common.legend = TRUE,ncol = 3)
+
+ggsave(surv_fig, height = 9, width = 18, dpi = 640, file = 'annual_survival.png')
+
+
+survivals <- rbind.data.frame(adult_survival,sub_survival, juv_survival )
+
+
+library("rnaturalearth")
+library("rnaturalearthdata")
+library(ggplot2);library(see)
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world <- subset(world,  admin != 'Canada' & admin != 'United States of America')
+library("sf")
+
+world_points<- st_centroid(world)
+world_points <- cbind(world, st_coordinates(st_centroid(world$geometry)))
+states <- ne_states(returnclass = "sf")
+states <- subset(states, admin == 'Canada'| admin == 'United States of America')
+
+bands.breed$REGION <- factor(bands.breed$REGION, levels = c(98,3,43))
+
+rel_fig <-  ggplot(data = world) +
+  geom_sf() +
+  geom_sf(data = states) +
+  geom_point(data = bands.breed , aes(x = LON_DECIMAL_DEGREES  , y = LAT_DECIMAL_DEGREES, fill = as.factor(REGION)), size = 5, shape = 21, alpha = .75) + #, fill = 'black') +
+  coord_sf(xlim = c(-185, -100), ylim = c(55, 85), expand = FALSE)+
+  labs(y ='',x='', fill = 'Region: ') +
+  scale_fill_flat_d(labels = c('Wrengel Island','North Slope','Banks Island/Sachs Harbor')) + scale_size_manual(values = c(2,1.5), guide = FALSE) +
+  theme_modern(legend.position = 'top',axis.text.size = 10,legend.title.size = 10,legend.text.size = 10) +theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1))
+rel_fig
+
+
+
